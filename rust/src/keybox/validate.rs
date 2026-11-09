@@ -16,6 +16,7 @@ const MAX_PEM_BODY_BYTES: usize = 65_536;
 const PRE_NTP_EPOCH_SECS: u64 = 1_577_836_800;
 
 const ROOT_GOOGLE_PEM: &[u8] = include_bytes!("roots/google.pem");
+const ROOT_GOOGLE_RKP_PEM: &[u8] = include_bytes!("roots/google_rkp.pem");
 const ROOT_AOSP_EC_PEM: &[u8] = include_bytes!("roots/aosp_ec.pem");
 const ROOT_AOSP_RSA_PEM: &[u8] = include_bytes!("roots/aosp_rsa.pem");
 const ROOT_KNOX_PEM: &[u8] = include_bytes!("roots/knox.pem");
@@ -432,11 +433,13 @@ fn verify_signature(
         OID_RSA_SHA512 => do_verify(&signature::RSA_PKCS1_2048_8192_SHA512),
         OID_ECDSA_SHA256 => match curve_oid(pubkey_alg).as_deref() {
             Some(OID_CURVE_P256) => do_verify(&signature::ECDSA_P256_SHA256_ASN1),
+            Some(OID_CURVE_P384) => do_verify(&signature::ECDSA_P384_SHA256_ASN1),
             Some(other) => bail!("ECDSA-SHA256 with unsupported curve OID {other}"),
             None => bail!("ECDSA-SHA256 missing curve OID"),
         },
         OID_ECDSA_SHA384 => match curve_oid(pubkey_alg).as_deref() {
             Some(OID_CURVE_P384) => do_verify(&signature::ECDSA_P384_SHA384_ASN1),
+            Some(OID_CURVE_P256) => do_verify(&signature::ECDSA_P256_SHA384_ASN1),
             Some(other) => bail!("ECDSA-SHA384 with unsupported curve OID {other}"),
             None => bail!("ECDSA-SHA384 missing curve OID"),
         },
@@ -466,6 +469,7 @@ fn trust_anchors() -> &'static [(KeyboxRootType, Vec<u8>)] {
     CELL.get_or_init(|| {
         let pairs = [
             (KeyboxRootType::Google, ROOT_GOOGLE_PEM),
+            (KeyboxRootType::Google, ROOT_GOOGLE_RKP_PEM),
             (KeyboxRootType::AospEc, ROOT_AOSP_EC_PEM),
             (KeyboxRootType::AospRsa, ROOT_AOSP_RSA_PEM),
             (KeyboxRootType::Knox, ROOT_KNOX_PEM),
@@ -497,7 +501,7 @@ fn match_private_key(
     errors: &mut Vec<String>,
 ) -> KeyMatch {
     let leaf_spki = leaf.public_key().raw;
-    let cleaned = strip_pem_indent(private_pem);
+    let cleaned = rewrap_pem(&strip_pem_indent(private_pem));
 
     if let Some(verdict) = try_match_rsa(&cleaned, leaf_spki, errors) {
         return verdict;
@@ -508,9 +512,157 @@ fn match_private_key(
     if let Some(verdict) = try_match_p384(&cleaned, leaf_spki, errors) {
         return verdict;
     }
+    // SEC1 EC keys (`BEGIN EC PRIVATE KEY`, e.g. every Yurikey release) are
+    // not PKCS#8, so the parsers above reject them. Wrap the SEC1 structure
+    // in a PKCS#8 PrivateKeyInfo envelope and retry through the same path.
+    if cleaned.contains("EC PRIVATE KEY") {
+        if let Some(pkcs8) = sec1_to_pkcs8_pem(&cleaned) {
+            if let Some(verdict) = try_match_p256(&pkcs8, leaf_spki, errors) {
+                return verdict;
+            }
+            if let Some(verdict) = try_match_p384(&pkcs8, leaf_spki, errors) {
+                return verdict;
+            }
+        }
+    }
 
     errors.push("private key present but unparseable (encrypted PKCS#8, unsupported curve, or corrupt)".to_string());
     KeyMatch::Mismatched
+}
+
+/// Normalize a PEM block to 64-character base64 lines. The pem-rfc7468
+/// decoder behind the rsa/p256/p384 parsers rejects single-line bodies,
+/// which some keybox sources ship.
+fn rewrap_pem(pem: &str) -> String {
+    let mut label: Option<String> = None;
+    let mut body = String::new();
+    for line in pem.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("-----BEGIN ") {
+            label = Some(rest.trim_end_matches('-').trim().to_string());
+            continue;
+        }
+        if t.starts_with("-----END") {
+            break;
+        }
+        if label.is_some() {
+            body.push_str(t);
+        }
+    }
+    let Some(label) = label.filter(|_| !body.is_empty()) else {
+        return pem.to_string();
+    };
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for chunk in body.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    out
+}
+
+fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    if content.len() < 0x80 {
+        out.push(content.len() as u8);
+    } else if content.len() <= 0xff {
+        out.push(0x81);
+        out.push(content.len() as u8);
+    } else {
+        out.push(0x82);
+        out.push((content.len() >> 8) as u8);
+        out.push(content.len() as u8);
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+fn read_tlv(buf: &[u8], offset: usize) -> Option<(u8, &[u8], usize)> {
+    let tag = *buf.get(offset)?;
+    let mut pos = offset + 1;
+    let first = *buf.get(pos)?;
+    pos += 1;
+    let len = if first < 0x80 {
+        first as usize
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 2 {
+            return None;
+        }
+        let mut v = 0usize;
+        for _ in 0..n {
+            v = (v << 8) | (*buf.get(pos)? as usize);
+            pos += 1;
+        }
+        v
+    };
+    let end = pos.checked_add(len)?;
+    Some((tag, buf.get(pos..end)?, end))
+}
+
+/// Convert a SEC1 `ECPrivateKey` PEM to an equivalent PKCS#8 PEM.
+/// The curve is taken from the SEC1 `[0]` parameters when present and
+/// from the private-key length otherwise (32 bytes = P-256, 48 = P-384).
+fn sec1_to_pkcs8_pem(sec1_pem: &str) -> Option<String> {
+    let der = decode_pem_body(sec1_pem).ok()?;
+    let (tag, seq, _) = read_tlv(&der, 0)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (t, _version, next) = read_tlv(seq, 0)?;
+    if t != 0x02 {
+        return None;
+    }
+    let (t, priv_bytes, next) = read_tlv(seq, next)?;
+    if t != 0x04 {
+        return None;
+    }
+    // OID content bytes for prime256v1 and secp384r1.
+    const OID_P256_CONTENT: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+    const OID_P384_CONTENT: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
+    let mut curve_is_p384: Option<bool> = None;
+    if let Some((t, params, _)) = read_tlv(seq, next) {
+        if t == 0xa0 {
+            if let Some((ot, oid_content, _)) = read_tlv(params, 0) {
+                if ot == 0x06 {
+                    if oid_content == OID_P256_CONTENT {
+                        curve_is_p384 = Some(false);
+                    } else if oid_content == OID_P384_CONTENT {
+                        curve_is_p384 = Some(true);
+                    }
+                }
+            }
+        }
+    }
+    let is_p384 = curve_is_p384.unwrap_or(match priv_bytes.len() {
+        32 => false,
+        48 => true,
+        _ => return None,
+    });
+    // AlgorithmIdentifier for id-ecPublicKey + curve, as raw DER.
+    let alg: &[u8] = if is_p384 {
+        &[
+            0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x05, 0x2b,
+            0x81, 0x04, 0x00, 0x22,
+        ]
+    } else {
+        &[
+            0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+            0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+        ]
+    };
+    let mut info_content = vec![0x02, 0x01, 0x00];
+    info_content.extend_from_slice(alg);
+    info_content.extend_from_slice(&der_tlv(0x04, &der));
+    let pkcs8_der = der_tlv(0x30, &info_content);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&pkcs8_der);
+    let mut out = String::from("-----BEGIN PRIVATE KEY-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).ok()?);
+        out.push('\n');
+    }
+    out.push_str("-----END PRIVATE KEY-----\n");
+    Some(out)
 }
 
 fn try_match_rsa(pem: &str, leaf_spki: &[u8], errors: &mut Vec<String>) -> Option<KeyMatch> {
@@ -719,7 +871,7 @@ mod tests {
     #[test]
     fn trust_anchors_load() {
         let anchors = trust_anchors();
-        assert_eq!(anchors.len(), 4, "all 4 trust anchors must parse");
+        assert_eq!(anchors.len(), 5, "all 5 trust anchors must parse");
         for (kind, inner) in anchors {
             assert!(!inner.is_empty(), "anchor {kind:?} has empty pubkey inner");
         }

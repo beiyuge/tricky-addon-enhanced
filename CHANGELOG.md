@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased (fork fix)
+
+### Bug Fixes
+- **Keybox validator rejected valid Yurikey keyboxes** — three defects in `rust/src/keybox/validate.rs` made `keybox fetch` (and the WebUI badge) reject every recent Yurikey release: EC private keys in SEC1 format (`BEGIN EC PRIVATE KEY`) were only parsed as PKCS#8 and reported as unparseable; the trust anchors lacked Google's RKP attestation root (Key Attestation CA1, EC P-384), so RKP chains reported `root_type: unknown`; and ECDSA chain links signed with a P-384 key over SHA-256 (or P-256 over SHA-384) failed chain verification. The validator now wraps SEC1 keys into PKCS#8 before matching, ships the RKP root anchor alongside the RSA hardware root, verifies cross-curve ECDSA links, and re-wraps single-line PEM bodies that the strict PEM decoder rejects. Verified against Yurikey68: `chain_valid: true`, `root_type: google`, `key_match: matched`, `ok: true` (previously `ok: false`).
+
+
 ## v5.53.1 (2026-05-01)
 
 ### Bug Fixes
